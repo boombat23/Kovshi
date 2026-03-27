@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         default="yolo26n.pt",
         help="Базовая модель для дообучения (например yolo26n.pt или yolo11n.pt)",
     )
-    parser.add_argument("--epochs", type=int, default=150, help="Количество эпох")
+    parser.add_argument("--epochs", type=int, default=15, help="Количество эпох")
     parser.add_argument("--imgsz", type=int, default=960, help="Размер картинки для обучения")
     parser.add_argument("--batch", type=int, default=4, help="Batch size")
     parser.add_argument("--workers", type=int, default=2, help="DataLoader workers")
