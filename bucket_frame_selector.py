@@ -23,11 +23,12 @@ MIN_BBOX_W = 25
 MAX_BBOX_W = 1000
 MIN_BBOX_H = 25
 MAX_BBOX_H = 1000
+MIN_WIDTH_RATIO = 0.7
 ALPHA = 0.9
 MAX_MISSING_FRAMES = 6
 KERNEL_SIZE = 5
 MIN_FRAMES_BETWEEN_BUCKETS = 2
-CENTER_GATE_PX = 120
+CENTER_GATE_PX = 80
 
 SHOW_PREVIEW = True
 SAVE_DEBUG_VIDEO = False
@@ -57,6 +58,7 @@ class RuntimeConfig:
     max_bbox_w: int = MAX_BBOX_W
     min_bbox_h: int = MIN_BBOX_H
     max_bbox_h: int = MAX_BBOX_H
+    min_width_ratio: float = MIN_WIDTH_RATIO
     alpha: float = ALPHA
     max_missing_frames: int = MAX_MISSING_FRAMES
     kernel_size: int = KERNEL_SIZE
@@ -98,6 +100,9 @@ def validate_config(config: RuntimeConfig) -> RuntimeConfig:
     if config.max_bbox_w < config.min_bbox_w or config.max_bbox_h < config.min_bbox_h:
         raise ValueError("Maximum bbox dimensions must be >= minimum bbox dimensions")
 
+    if not (0.0 < config.min_width_ratio <= 1.0):
+        raise ValueError("min_width_ratio must be in (0, 1]")
+
     if config.kernel_size < 1:
         raise ValueError("kernel_size must be >= 1")
 
@@ -131,8 +136,8 @@ def select_best_contour(mask: np.ndarray, config: RuntimeConfig) -> Optional[Tup
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
 
-    _, roi_w = mask.shape[:2]
-    roi_center_x = roi_w / 2.0
+    roi_h, roi_w = mask.shape[:2]
+    roi_center_y = roi_h / 2.0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -144,13 +149,14 @@ def select_best_contour(mask: np.ndarray, config: RuntimeConfig) -> Optional[Tup
             continue
         if not (config.min_bbox_h <= h <= config.max_bbox_h):
             continue
-
-        center_x = x + w / 2.0
-        distance_to_center = abs(center_x - roi_center_x)
-        if distance_to_center > config.center_gate_px:
+        if w < roi_w * config.min_width_ratio:
             continue
 
-        candidates.append((x, y, w, h, distance_to_center, area))
+        distance_to_horizon = min(abs(y - roi_center_y), abs((y + h) - roi_center_y))
+        if distance_to_horizon > config.center_gate_px:
+            continue
+
+        candidates.append((x, y, w, h, distance_to_horizon, area))
 
     if not candidates:
         return None
@@ -168,7 +174,7 @@ def laplacian_sharpness(frame_bgr: np.ndarray) -> float:
 def score_candidate(
     roi_frame: np.ndarray,
     bbox: Tuple[int, int, int, int],
-    distance_to_center: float,
+    distance_to_horizon: float,
     alpha: float,
 ) -> Tuple[float, float]:
     x, y, w, h = bbox
@@ -177,7 +183,7 @@ def score_candidate(
         return float("-inf"), 0.0
 
     sharpness = laplacian_sharpness(crop)
-    score = sharpness - alpha * distance_to_center
+    score = sharpness - alpha * distance_to_horizon
     return score, sharpness
 
 
@@ -194,8 +200,8 @@ def draw_debug(
     vis = frame.copy()
 
     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 255), 2)
-    center_x = (x1 + x2) // 2
-    cv2.line(vis, (center_x, y1), (center_x, y2), (255, 255, 0), 2)
+    center_y = (y1 + y2) // 2
+    cv2.line(vis, (x1, center_y), (x2, center_y), (255, 255, 0), 2)
 
     if bbox_roi is not None:
         bx, by, bw, bh = bbox_roi
