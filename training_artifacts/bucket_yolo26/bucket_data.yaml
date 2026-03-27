@@ -1,0 +1,6 @@
+path: C:\Users\maxsh\PycharmProjects\Kovshi
+train: C:\Users\maxsh\PycharmProjects\Kovshi\training_artifacts\bucket_yolo26\train.txt
+val: C:\Users\maxsh\PycharmProjects\Kovshi\training_artifacts\bucket_yolo26\val.txt
+names:
+  0: bucket
+nc: 1
