@@ -17,22 +17,23 @@ VIDEO_PATH = Path(r"kovshi_video\3.mp4")
 OUTPUT_DIR = Path("output_frames")
 
 ROI = (100, 100, 650, 900)  # (x1, y1, x2, y2) in full-frame coordinates
-MIN_AREA = 1200
-MAX_AREA = 120000
-MIN_BBOX_W = 25
-MAX_BBOX_W = 1000
-MIN_BBOX_H = 25
-MAX_BBOX_H = 1000
-MIN_WIDTH_RATIO = 0.7
-ALPHA = 0.9
+MIN_GAP_AREA = 400
+MAX_GAP_AREA = 80000
+MIN_GAP_BBOX_W = 20
+MAX_GAP_BBOX_W = 1000
+MIN_GAP_BBOX_H = 8
+MAX_GAP_BBOX_H = 400
+MIN_GAP_WIDTH_RATIO = 0.2
+SYMMETRY_TOLERANCE_PX = 12
 MAX_MISSING_FRAMES = 6
 KERNEL_SIZE = 5
 MIN_FRAMES_BETWEEN_BUCKETS = 2
-CENTER_GATE_PX = 80
+CENTER_GATE_PX = 120
 
 SHOW_PREVIEW = True
 SAVE_DEBUG_VIDEO = False
 DEBUG_VIDEO_PATH = Path("debug_preview.mp4")
+DRAW_SELECTED_OVERLAY = True
 
 
 @dataclass
@@ -42,7 +43,7 @@ class TrackState:
     best_score: float = float("-inf")
     best_frame: Optional[np.ndarray] = None
     best_frame_idx: int = -1
-    best_bbox: Optional[Tuple[int, int, int, int]] = None
+    best_gap_bboxes: Optional[Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]] = None
     last_seen_frame_idx: int = -1
     bucket_index: int = 0
 
@@ -52,14 +53,14 @@ class RuntimeConfig:
     video_path: Path = VIDEO_PATH
     output_dir: Path = OUTPUT_DIR
     roi: Tuple[int, int, int, int] = ROI
-    min_area: int = MIN_AREA
-    max_area: int = MAX_AREA
-    min_bbox_w: int = MIN_BBOX_W
-    max_bbox_w: int = MAX_BBOX_W
-    min_bbox_h: int = MIN_BBOX_H
-    max_bbox_h: int = MAX_BBOX_H
-    min_width_ratio: float = MIN_WIDTH_RATIO
-    alpha: float = ALPHA
+    min_gap_area: int = MIN_GAP_AREA
+    max_gap_area: int = MAX_GAP_AREA
+    min_gap_bbox_w: int = MIN_GAP_BBOX_W
+    max_gap_bbox_w: int = MAX_GAP_BBOX_W
+    min_gap_bbox_h: int = MIN_GAP_BBOX_H
+    max_gap_bbox_h: int = MAX_GAP_BBOX_H
+    min_gap_width_ratio: float = MIN_GAP_WIDTH_RATIO
+    symmetry_tolerance_px: int = SYMMETRY_TOLERANCE_PX
     max_missing_frames: int = MAX_MISSING_FRAMES
     kernel_size: int = KERNEL_SIZE
     min_frames_between_buckets: int = MIN_FRAMES_BETWEEN_BUCKETS
@@ -67,6 +68,7 @@ class RuntimeConfig:
     show_preview: bool = SHOW_PREVIEW
     save_debug_video: bool = SAVE_DEBUG_VIDEO
     debug_video_path: Path = DEBUG_VIDEO_PATH
+    draw_selected_overlay: bool = DRAW_SELECTED_OVERLAY
 
 
 @dataclass
@@ -91,17 +93,17 @@ def validate_roi(roi: Tuple[int, int, int, int], frame_w: int, frame_h: int) -> 
 
 
 def validate_config(config: RuntimeConfig) -> RuntimeConfig:
-    if config.min_area <= 0 or config.max_area <= 0 or config.min_area >= config.max_area:
-        raise ValueError("Area thresholds must satisfy 0 < min_area < max_area")
+    if config.min_gap_area <= 0 or config.max_gap_area <= 0 or config.min_gap_area >= config.max_gap_area:
+        raise ValueError("Gap area thresholds must satisfy 0 < min_gap_area < max_gap_area")
 
-    if config.min_bbox_w <= 0 or config.min_bbox_h <= 0:
-        raise ValueError("Minimum bbox dimensions must be positive")
+    if config.min_gap_bbox_w <= 0 or config.min_gap_bbox_h <= 0:
+        raise ValueError("Minimum gap bbox dimensions must be positive")
 
-    if config.max_bbox_w < config.min_bbox_w or config.max_bbox_h < config.min_bbox_h:
-        raise ValueError("Maximum bbox dimensions must be >= minimum bbox dimensions")
+    if config.max_gap_bbox_w < config.min_gap_bbox_w or config.max_gap_bbox_h < config.min_gap_bbox_h:
+        raise ValueError("Maximum gap bbox dimensions must be >= minimum gap bbox dimensions")
 
-    if not (0.0 < config.min_width_ratio <= 1.0):
-        raise ValueError("min_width_ratio must be in (0, 1]")
+    if not (0.0 < config.min_gap_width_ratio <= 1.0):
+        raise ValueError("min_gap_width_ratio must be in (0, 1]")
 
     if config.kernel_size < 1:
         raise ValueError("kernel_size must be >= 1")
@@ -112,8 +114,8 @@ def validate_config(config: RuntimeConfig) -> RuntimeConfig:
     if config.max_missing_frames < 0 or config.min_frames_between_buckets < 0:
         raise ValueError("Frame-gap parameters must be non-negative")
 
-    if config.center_gate_px < 0:
-        raise ValueError("center_gate_px must be non-negative")
+    if config.center_gate_px < 0 or config.symmetry_tolerance_px < 0:
+        raise ValueError("center_gate_px and symmetry_tolerance_px must be non-negative")
 
     return config
 
@@ -132,38 +134,76 @@ def preprocess_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
     return closed
 
 
-def select_best_contour(mask: np.ndarray, config: RuntimeConfig) -> Optional[Tuple[int, int, int, int, float]]:
+def extract_dark_mask(roi_frame: np.ndarray, kernel_size: int) -> np.ndarray:
+    gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+    dark_threshold = int(np.clip(np.percentile(blur, 22), 10, 120))
+    _, dark_mask = cv2.threshold(blur, dark_threshold, 255, cv2.THRESH_BINARY_INV)
+    return preprocess_mask(dark_mask, kernel_size)
+
+
+def select_gap_pair(
+    mask: np.ndarray,
+    config: RuntimeConfig,
+) -> Optional[Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int], float]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
+    candidates: list[Tuple[int, int, int, int, float, float]] = []
 
     roi_h, roi_w = mask.shape[:2]
     roi_center_y = roi_h / 2.0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < config.min_area or area > config.max_area:
+        if area < config.min_gap_area or area > config.max_gap_area:
             continue
 
         x, y, w, h = cv2.boundingRect(cnt)
-        if not (config.min_bbox_w <= w <= config.max_bbox_w):
+        if not (config.min_gap_bbox_w <= w <= config.max_gap_bbox_w):
             continue
-        if not (config.min_bbox_h <= h <= config.max_bbox_h):
+        if not (config.min_gap_bbox_h <= h <= config.max_gap_bbox_h):
             continue
-        if w < roi_w * config.min_width_ratio:
+        if w < roi_w * config.min_gap_width_ratio:
             continue
 
-        distance_to_horizon = min(abs(y - roi_center_y), abs((y + h) - roi_center_y))
+        center_y = y + h / 2.0
+        distance_to_horizon = abs(center_y - roi_center_y)
         if distance_to_horizon > config.center_gate_px:
             continue
 
-        candidates.append((x, y, w, h, distance_to_horizon, area))
+        candidates.append((x, y, w, h, center_y, area))
 
-    if not candidates:
+    if len(candidates) < 2:
         return None
 
-    candidates.sort(key=lambda item: (item[4], -item[5]))
-    x, y, w, h, dist, _ = candidates[0]
-    return x, y, w, h, dist
+    upper = [c for c in candidates if c[4] < roi_center_y]
+    lower = [c for c in candidates if c[4] >= roi_center_y]
+    if not upper or not lower:
+        return None
+
+    best_pair = None
+    best_symmetry_error = float("inf")
+    best_total_area = float("-inf")
+
+    for up in upper:
+        for low in lower:
+            dist_up = roi_center_y - up[4]
+            dist_low = low[4] - roi_center_y
+            symmetry_error = abs(dist_up - dist_low)
+            if symmetry_error > config.symmetry_tolerance_px:
+                continue
+
+            total_area = up[5] + low[5]
+            if symmetry_error < best_symmetry_error or (
+                symmetry_error == best_symmetry_error and total_area > best_total_area
+            ):
+                best_symmetry_error = symmetry_error
+                best_total_area = total_area
+                best_pair = ((up[0], up[1], up[2], up[3]), (low[0], low[1], low[2], low[3]))
+
+    if best_pair is None:
+        return None
+
+    return best_pair[0], best_pair[1], best_symmetry_error
 
 
 def laplacian_sharpness(frame_bgr: np.ndarray) -> float:
@@ -171,28 +211,29 @@ def laplacian_sharpness(frame_bgr: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def score_candidate(
+def score_gap_pair(
     roi_frame: np.ndarray,
-    bbox: Tuple[int, int, int, int],
-    distance_to_horizon: float,
-    alpha: float,
+    gap_pair: Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]],
+    symmetry_error: float,
 ) -> Tuple[float, float]:
-    x, y, w, h = bbox
-    crop = roi_frame[y : y + h, x : x + w]
-    if crop.size == 0:
+    (x1, y1, w1, h1), (x2, y2, w2, h2) = gap_pair
+    crop_up = roi_frame[y1 : y1 + h1, x1 : x1 + w1]
+    crop_down = roi_frame[y2 : y2 + h2, x2 : x2 + w2]
+    if crop_up.size == 0 or crop_down.size == 0:
         return float("-inf"), 0.0
 
-    sharpness = laplacian_sharpness(crop)
-    score = sharpness - alpha * distance_to_horizon
+    sharpness = (laplacian_sharpness(crop_up) + laplacian_sharpness(crop_down)) / 2.0
+    score = -symmetry_error + 0.01 * sharpness
     return score, sharpness
 
 
 def draw_debug(
     frame: np.ndarray,
     roi: Tuple[int, int, int, int],
-    bbox_roi: Optional[Tuple[int, int, int, int]],
+    gap_bboxes_roi: Optional[Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]],
     score: Optional[float],
     sharpness: Optional[float],
+    symmetry_error: Optional[float],
     bucket_idx: int,
     active: bool,
 ) -> np.ndarray:
@@ -203,15 +244,17 @@ def draw_debug(
     center_y = (y1 + y2) // 2
     cv2.line(vis, (x1, center_y), (x2, center_y), (255, 255, 0), 2)
 
-    if bbox_roi is not None:
-        bx, by, bw, bh = bbox_roi
-        cv2.rectangle(vis, (x1 + bx, y1 + by), (x1 + bx + bw, y1 + by + bh), (0, 255, 0), 2)
+    if gap_bboxes_roi is not None:
+        for bx, by, bw, bh in gap_bboxes_roi:
+            cv2.rectangle(vis, (x1 + bx, y1 + by), (x1 + bx + bw, y1 + by + bh), (0, 255, 0), 2)
 
     status = "TRACKING" if active else "IDLE"
     lines = [f"Bucket: {bucket_idx + (1 if active else 0)}", f"State: {status}"]
     if score is not None and sharpness is not None:
         lines.append(f"Score: {score:.2f}")
         lines.append(f"Sharpness: {sharpness:.2f}")
+    if symmetry_error is not None:
+        lines.append(f"Symmetry err: {symmetry_error:.2f}")
 
     y_text = 30
     for line in lines:
@@ -245,7 +288,7 @@ def reset_track(track: TrackState) -> None:
     track.best_score = float("-inf")
     track.best_frame = None
     track.best_frame_idx = -1
-    track.best_bbox = None
+    track.best_gap_bboxes = None
 
 
 def run(config: RuntimeConfig) -> None:
@@ -273,27 +316,25 @@ def run(config: RuntimeConfig) -> None:
     ctx = VideoContext(fps=fps if fps > 0 else 25.0, frame_size=(frame_w, frame_h))
     debug_writer = create_debug_writer(config.debug_video_path, ctx) if config.save_debug_video else None
 
-    back_sub = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=20, detectShadows=False)
-
     track = TrackState()
     frame_idx = 0
 
     def process_frame(frame: np.ndarray, current_idx: int) -> np.ndarray:
         roi_frame = frame[y1:y2, x1:x2]
-        fg_mask = back_sub.apply(roi_frame)
-        cleaned_mask = preprocess_mask(fg_mask, config.kernel_size)
-
-        detection = select_best_contour(cleaned_mask, config)
+        dark_mask = extract_dark_mask(roi_frame, config.kernel_size)
+        detection = select_gap_pair(dark_mask, config)
         score = None
         sharpness = None
-        bbox = None
+        symmetry_error = None
+        gap_bboxes = None
 
         if detection is not None:
-            bx, by, bw, bh, dist = detection
-            bbox = (bx, by, bw, bh)
-            cand_score, cand_sharp = score_candidate(roi_frame, bbox, dist, config.alpha)
+            up_gap, down_gap, sym_error = detection
+            gap_bboxes = (up_gap, down_gap)
+            cand_score, cand_sharp = score_gap_pair(roi_frame, gap_bboxes, sym_error)
             score = cand_score
             sharpness = cand_sharp
+            symmetry_error = sym_error
 
             if not track.active and current_idx - track.last_seen_frame_idx >= config.min_frames_between_buckets:
                 track.active = True
@@ -307,9 +348,21 @@ def run(config: RuntimeConfig) -> None:
 
                 if cand_score > track.best_score:
                     track.best_score = cand_score
-                    track.best_frame = frame.copy()
+                    if config.draw_selected_overlay:
+                        track.best_frame = draw_debug(
+                            frame=frame,
+                            roi=config.roi,
+                            gap_bboxes_roi=gap_bboxes,
+                            score=score,
+                            sharpness=sharpness,
+                            symmetry_error=symmetry_error,
+                            bucket_idx=track.bucket_index,
+                            active=track.active,
+                        )
+                    else:
+                        track.best_frame = frame.copy()
                     track.best_frame_idx = current_idx
-                    track.best_bbox = bbox
+                    track.best_gap_bboxes = gap_bboxes
 
         elif track.active:
             track.missing_frames += 1
@@ -320,9 +373,10 @@ def run(config: RuntimeConfig) -> None:
         return draw_debug(
             frame=frame,
             roi=config.roi,
-            bbox_roi=bbox,
+            gap_bboxes_roi=gap_bboxes,
             score=score,
             sharpness=sharpness,
+            symmetry_error=symmetry_error,
             bucket_idx=track.bucket_index,
             active=track.active,
         )
