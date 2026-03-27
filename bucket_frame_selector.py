@@ -13,10 +13,10 @@ import numpy as np
 # =========================
 # Tunable parameters
 # =========================
-VIDEO_PATH = Path("input_video.mp4")
+VIDEO_PATH = Path(r"kovshi_video\3.mp4")
 OUTPUT_DIR = Path("output_frames")
 
-ROI = (200, 100, 600, 700)  # (x1, y1, x2, y2) in full-frame coordinates
+ROI = (100, 100, 650, 900)  # (x1, y1, x2, y2) in full-frame coordinates
 MIN_AREA = 1200
 MAX_AREA = 120000
 MIN_BBOX_W = 25
