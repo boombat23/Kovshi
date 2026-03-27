@@ -25,6 +25,12 @@ MIN_GAP_BBOX_H = 8
 MAX_GAP_BBOX_H = 400
 MIN_GAP_WIDTH_RATIO = 0.2
 SYMMETRY_TOLERANCE_PX = 12
+MAX_SYMMETRY_FRACTION = 0.12
+MIN_GAP_ASPECT_RATIO = 3.0
+MIN_GAP_BLACKNESS = 8.0
+MIN_GAP_CONTRAST = 6.0
+MIN_GAP_X_OVERLAP_RATIO = 0.4
+MIN_GAP_WIDTH_SIMILARITY = 0.6
 MAX_MISSING_FRAMES = 6
 KERNEL_SIZE = 5
 MIN_FRAMES_BETWEEN_BUCKETS = 2
@@ -61,6 +67,12 @@ class RuntimeConfig:
     max_gap_bbox_h: int = MAX_GAP_BBOX_H
     min_gap_width_ratio: float = MIN_GAP_WIDTH_RATIO
     symmetry_tolerance_px: int = SYMMETRY_TOLERANCE_PX
+    max_symmetry_fraction: float = MAX_SYMMETRY_FRACTION
+    min_gap_aspect_ratio: float = MIN_GAP_ASPECT_RATIO
+    min_gap_blackness: float = MIN_GAP_BLACKNESS
+    min_gap_contrast: float = MIN_GAP_CONTRAST
+    min_gap_x_overlap_ratio: float = MIN_GAP_X_OVERLAP_RATIO
+    min_gap_width_similarity: float = MIN_GAP_WIDTH_SIMILARITY
     max_missing_frames: int = MAX_MISSING_FRAMES
     kernel_size: int = KERNEL_SIZE
     min_frames_between_buckets: int = MIN_FRAMES_BETWEEN_BUCKETS
@@ -105,6 +117,21 @@ def validate_config(config: RuntimeConfig) -> RuntimeConfig:
     if not (0.0 < config.min_gap_width_ratio <= 1.0):
         raise ValueError("min_gap_width_ratio must be in (0, 1]")
 
+    if config.min_gap_aspect_ratio <= 0:
+        raise ValueError("min_gap_aspect_ratio must be > 0")
+
+    if config.min_gap_blackness < 0 or config.min_gap_contrast < 0:
+        raise ValueError("Darkness constraints must be non-negative")
+
+    if not (0.0 < config.max_symmetry_fraction <= 1.0):
+        raise ValueError("max_symmetry_fraction must be in (0, 1]")
+
+    if not (0.0 <= config.min_gap_x_overlap_ratio <= 1.0):
+        raise ValueError("min_gap_x_overlap_ratio must be in [0, 1]")
+
+    if not (0.0 < config.min_gap_width_similarity <= 1.0):
+        raise ValueError("min_gap_width_similarity must be in (0, 1]")
+
     if config.kernel_size < 1:
         raise ValueError("kernel_size must be >= 1")
 
@@ -137,20 +164,46 @@ def preprocess_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
 def extract_dark_mask(roi_frame: np.ndarray, kernel_size: int) -> np.ndarray:
     gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-    dark_threshold = int(np.clip(np.percentile(blur, 22), 10, 120))
+    dark_threshold = int(np.clip(np.percentile(blur, 32), 10, 140))
     _, dark_mask = cv2.threshold(blur, dark_threshold, 255, cv2.THRESH_BINARY_INV)
-    return preprocess_mask(dark_mask, kernel_size)
+
+    # Dark horizontal slits between buckets stand out after a horizontal black-hat.
+    horiz_kernel_w = max(15, ((blur.shape[1] // 8) // 2) * 2 + 1)
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_kernel_w, 3))
+    blackhat = cv2.morphologyEx(blur, cv2.MORPH_BLACKHAT, horiz_kernel)
+    line_threshold = int(np.clip(np.percentile(blackhat, 82), 8, 120))
+    _, line_mask = cv2.threshold(blackhat, line_threshold, 255, cv2.THRESH_BINARY)
+
+    combined = cv2.bitwise_or(dark_mask, line_mask)
+    combined = preprocess_mask(combined, kernel_size)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, kernel_size * 4), max(3, kernel_size - 1)))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_kernel)
+    return combined
+
+
+def x_overlap_ratio(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax1, _, aw, _ = a
+    bx1, _, bw, _ = b
+    ax2 = ax1 + aw
+    bx2 = bx1 + bw
+    overlap = max(0, min(ax2, bx2) - max(ax1, bx1))
+    min_w = max(1, min(aw, bw))
+    return overlap / float(min_w)
 
 
 def select_gap_pair(
     mask: np.ndarray,
+    roi_frame: np.ndarray,
     config: RuntimeConfig,
 ) -> Optional[Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int], float]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates: list[Tuple[int, int, int, int, float, float]] = []
+    candidates: list[Tuple[int, int, int, int, float, float, float]] = []
 
     roi_h, roi_w = mask.shape[:2]
     roi_center_y = roi_h / 2.0
+    gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+
+    roi_mean_gray = float(np.mean(gray))
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -164,13 +217,34 @@ def select_gap_pair(
             continue
         if w < roi_w * config.min_gap_width_ratio:
             continue
+        if (w / max(h, 1)) < config.min_gap_aspect_ratio:
+            continue
 
         center_y = y + h / 2.0
         distance_to_horizon = abs(center_y - roi_center_y)
         if distance_to_horizon > config.center_gate_px:
             continue
 
-        candidates.append((x, y, w, h, center_y, area))
+        pad = max(1, int(round(h * 0.6)))
+        y0 = max(0, y)
+        y1 = min(roi_h, y + h)
+        ext0 = max(0, y - pad)
+        ext1 = min(roi_h, y + h + pad)
+        band = gray[y0:y1, x : x + w]
+        surround = gray[ext0:ext1, x : x + w]
+        if band.size == 0 or surround.size == 0:
+            continue
+        band_mean = float(np.mean(band))
+        surround_mean = float(np.mean(surround))
+        contrast = surround_mean - band_mean
+        if band_mean > (roi_mean_gray - config.min_gap_blackness):
+            continue
+        if band_mean > (surround_mean - 1.0):
+            continue
+        if contrast < config.min_gap_contrast:
+            continue
+
+        candidates.append((x, y, w, h, center_y, area, contrast))
 
     if len(candidates) < 2:
         return None
@@ -183,22 +257,36 @@ def select_gap_pair(
     best_pair = None
     best_symmetry_error = float("inf")
     best_total_area = float("-inf")
+    best_pair_contrast = float("-inf")
+    max_allowed_symmetry = max(config.symmetry_tolerance_px, roi_h * config.max_symmetry_fraction)
 
     for up in upper:
         for low in lower:
             dist_up = roi_center_y - up[4]
             dist_low = low[4] - roi_center_y
             symmetry_error = abs(dist_up - dist_low)
-            if symmetry_error > config.symmetry_tolerance_px:
+            if symmetry_error > max_allowed_symmetry:
+                continue
+
+            up_box = (up[0], up[1], up[2], up[3])
+            low_box = (low[0], low[1], low[2], low[3])
+            if x_overlap_ratio(up_box, low_box) < config.min_gap_x_overlap_ratio:
+                continue
+
+            width_similarity = min(up[2], low[2]) / float(max(up[2], low[2]))
+            if width_similarity < config.min_gap_width_similarity:
                 continue
 
             total_area = up[5] + low[5]
+            pair_contrast = up[6] + low[6]
             if symmetry_error < best_symmetry_error or (
-                symmetry_error == best_symmetry_error and total_area > best_total_area
+                symmetry_error == best_symmetry_error
+                and (pair_contrast > best_pair_contrast or (pair_contrast == best_pair_contrast and total_area > best_total_area))
             ):
                 best_symmetry_error = symmetry_error
+                best_pair_contrast = pair_contrast
                 best_total_area = total_area
-                best_pair = ((up[0], up[1], up[2], up[3]), (low[0], low[1], low[2], low[3]))
+                best_pair = (up_box, low_box)
 
     if best_pair is None:
         return None
@@ -322,7 +410,7 @@ def run(config: RuntimeConfig) -> None:
     def process_frame(frame: np.ndarray, current_idx: int) -> np.ndarray:
         roi_frame = frame[y1:y2, x1:x2]
         dark_mask = extract_dark_mask(roi_frame, config.kernel_size)
-        detection = select_gap_pair(dark_mask, config)
+        detection = select_gap_pair(dark_mask, roi_frame, config)
         score = None
         sharpness = None
         symmetry_error = None
